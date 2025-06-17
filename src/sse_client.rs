@@ -1,6 +1,7 @@
 use http::{header::AUTHORIZATION, HeaderName, HeaderValue};
 use log::debug;
 use reqwest::Client as HttpClient;
+use serde_json;
 
 /**
  * Create a local server that proxies requests to a remote server over SSE.
@@ -141,8 +142,40 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
     // Create server with proxy handler and stdio transport
     let server = proxy_handler.serve(stdio_transport).await?;
 
-    // Wait for completion
-    server.waiting().await?;
+    // Wait for completion or shutdown signal
+    tokio::select! {
+        result = server.waiting() => {
+            result?;
+        }
+        signal_name = async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = async {
+                        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                        term.recv().await
+                    } => "SIGTERM",
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.unwrap();
+                "SIGINT"
+            }
+        } => {
+            // Log signal receipt as structured JSON
+            let signal_log = serde_json::json!({
+                "event": "signal_received",
+                "signal": signal_name,
+                "action": "shutting_down",
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            
+            // Log to console (no remote logging available in client mode)
+            println!("[CMD] - {}", signal_log.to_string());
+        }
+    }
 
     Ok(())
 }

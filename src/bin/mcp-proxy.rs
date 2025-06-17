@@ -59,6 +59,14 @@ struct Cli {
     /// Host to expose an SSE server on. Default is 127.0.0.1
     #[arg(long = "sse-host", default_value = "127.0.0.1")]
     sse_host: String,
+
+    /// URL to send logs to (optional)
+    #[arg(long = "log-url", env = "LOG_URL")]
+    log_url: Option<String>,
+
+    /// Access token for logging service
+    #[arg(long = "mathom-access-token", env = "MATHOM_ACCESS_TOKEN")]
+    mathom_access_token: Option<String>,
 }
 
 #[tokio::main]
@@ -144,6 +152,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             command: command_or_url,
             args: cli.args,
             env: env_map,
+            log_url: cli.log_url,
+            access_token: cli.mathom_access_token,
         };
 
         // Create SSE server settings
