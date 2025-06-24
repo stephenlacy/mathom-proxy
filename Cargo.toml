@@ -12,20 +12,25 @@ name = "mcp-proxy"
 path = "src/bin/mcp-proxy.rs"
 
 [dependencies]
-rmcp = { git = "https://github.com/stephenlacy/rust-sdk", rev = "c62cfb9611a134163498a6892e3491408701e5ce", features = [
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "1f7f4d30550129f43bcbd7f526ad89614df30b56", features = [
   "server",
   "client",
-  "transport-sse",
-  "transport-sse-server",
   "transport-child-process",
+  "transport-sse-server",
+  "transport-sse-client",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client",
   "transport-io",
+  "reqwest",
+  "auth",
 ] }
 
 
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+tower = "0.5"
 tokio-util = { version = "0.7" }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 axum = "0.8"
 tower-http = { version = "0.6.2", features = ["cors"] }

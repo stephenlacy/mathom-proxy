@@ -1,12 +1,22 @@
 use crate::proxy_handler::ProxyHandler;
+use axum::{
+    extract::State,
+    http::{HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing, Router,
+};
 /**
- * Create a local SSE server that proxies requests to a stdio MCP server.
+ * Create a local HTTP+streamable server that proxies requests to a stdio MCP server.
  */
 use rmcp::{
     model::{ClientCapabilities, ClientInfo},
-    transport::sse_server::{SseServer, SseServerConfig},
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
     ServiceExt,
 };
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -15,19 +25,22 @@ use std::{
     collections::HashMap, error::Error as StdError, net::SocketAddr, sync::Arc, time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 #[cfg(unix)]
 use crate::utils::signal_number_to_name;
 
-/// Settings for the SSE server
-pub struct SseServerSettings {
+/// Settings for the HTTP server (with SSE fallback)
+pub struct HttpServerSettings {
     pub bind_addr: SocketAddr,
     pub keep_alive: Option<Duration>,
 }
@@ -157,25 +170,22 @@ impl SseServerManager {
         self.logger.log(line, stream_type).await;
     }
 
-    /// Run the SSE server with a stdio client
-    pub async fn run_sse_server(
+    /// Run the HTTP server with StreamableHttpService and SSE fallback
+    pub async fn run_http_server(
         &self,
         stdio_params: StdioServerParameters,
-        sse_settings: SseServerSettings,
+        http_settings: HttpServerSettings,
     ) -> Result<(), Box<dyn StdError>> {
         info!(
-            "Running SSE server on {:?} with command: {}",
-            sse_settings.bind_addr, stdio_params.command,
+            "Starting HTTP server with StreamableHttpService on {:?} with command: {}",
+            http_settings.bind_addr, stdio_params.command,
         );
 
-        // Configure SSE server
-        let config = SseServerConfig {
-            bind: sse_settings.bind_addr,
-            sse_path: "/sse".to_string(),
-            post_path: "/message".to_string(),
-            ct: CancellationToken::new(),
-            sse_keep_alive: sse_settings.keep_alive,
-        };
+        let cancellation_token = CancellationToken::new();
+
+        // Create notification broadcast channel for SSE notifications
+        let (notification_tx, _) = broadcast::channel(100);
+        let notification_tx = Arc::new(notification_tx);
 
         // Create child process with stdout/stderr logging
         let logging_process = self
@@ -186,57 +196,215 @@ impl SseServerManager {
             )
             .await?;
 
+        // Wrap the transport to capture notifications
+        let notification_capturing_transport =
+            NotificationCapturingTransport::new(logging_process, notification_tx.clone());
+
         let client_info = ClientInfo {
             protocol_version: Default::default(),
             capabilities: ClientCapabilities::builder().enable_sampling().build(),
             ..Default::default()
         };
 
-        let client = client_info.serve(logging_process).await?;
+        let client = client_info.serve(notification_capturing_transport).await?;
 
         let server_info = client.peer_info();
-        info!("Connected to server: {}", server_info.server_info.name);
+        info!(
+            "Connected to server: {}",
+            server_info.unwrap().server_info.name
+        );
 
-        let proxy_handler = ProxyHandler::new(client);
+        let proxy_handler = ProxyHandler::new_with_notifications(client, notification_tx.clone());
 
-        // Start the SSE server
-        let sse_server = SseServer::serve_with_config(config.clone()).await?;
+        // Create StreamableHttpService for HTTP streaming (primary transport)
+        // Enable stateful mode for proper SSE session management
+        let http_config = StreamableHttpServerConfig {
+            sse_keep_alive: http_settings.keep_alive,
+            stateful_mode: true,
+        };
 
-        let ct = sse_server.with_service(move || proxy_handler.clone());
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let proxy_clone_http = proxy_handler.clone();
+        let http_service = StreamableHttpService::new(
+            move || Ok(proxy_clone_http.clone()),
+            session_manager.clone(),
+            http_config,
+        );
 
-        // Wait for shutdown signals (SIGINT/SIGTERM)
-        let signal_name = {
-            #[cfg(unix)]
-            {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => "SIGINT",
-                    _ = async {
-                        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-                        term.recv().await
-                    } => "SIGTERM",
+        // Middleware for MCP protocol compliance (headers, session validation)
+        async fn mcp_protocol_middleware(
+            mut request: Request<axum::body::Body>,
+            next: Next,
+        ) -> Result<Response, StatusCode> {
+            let headers = request.headers_mut();
+
+            // Check if Accept header exists and needs fixing
+            let current_accept = headers
+                .get("accept")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string());
+
+            match &current_accept {
+                Some(accept)
+                    if !accept.contains("application/json")
+                        && !accept.contains("text/event-stream") =>
+                {
+                    headers.insert(
+                        "accept",
+                        HeaderValue::from_static("application/json, text/event-stream"),
+                    );
+                }
+                Some(accept) if !accept.contains("application/json") => {
+                    // Add application/json to existing accept header
+                    let new_accept = format!("{}, application/json", accept);
+                    if let Ok(header_value) = HeaderValue::from_str(&new_accept) {
+                        headers.insert("accept", header_value);
+                    }
+                }
+                Some(accept) if !accept.contains("text/event-stream") => {
+                    // Add text/event-stream to existing accept header
+                    let new_accept = format!("{}, text/event-stream", accept);
+                    if let Ok(header_value) = HeaderValue::from_str(&new_accept) {
+                        headers.insert("accept", header_value);
+                    }
+                }
+                None => {
+                    // No Accept header, add both
+                    headers.insert(
+                        "accept",
+                        HeaderValue::from_static("application/json, text/event-stream"),
+                    );
+                }
+                _ => {
+                    // Accept header already contains both, no change needed
+                    if let Some(accept) = &current_accept {
+                        tracing::debug!("Accept header already valid: {}", accept);
+                    }
                 }
             }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await?;
-                "SIGINT"
+
+            let mut response = next.run(request).await;
+
+            // Add MCP protocol headers to all responses per 2025-06-18 spec
+            let headers = response.headers_mut();
+            headers.insert(
+                "mcp-protocol-version",
+                HeaderValue::from_static("2025-06-18"),
+            );
+
+            Ok(response)
+        }
+
+        let cors_layer = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_credentials(false);
+
+        let sse_proxy = proxy_handler.clone();
+        let notification_tx_clone = notification_tx.clone();
+
+        // Create SSE handler with notification support
+        let sse_handler = move |State(_proxy): State<ProxyHandler>| {
+            let notification_rx = notification_tx_clone.subscribe();
+            async move {
+                use futures::stream::{self, StreamExt};
+                use std::convert::Infallible;
+                use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
+
+                tracing::debug!("SSE connection established");
+
+                let endpoint_event = stream::once(async {
+                    Ok::<_, Infallible>(
+                        axum::response::sse::Event::default()
+                            .event("endpoint")
+                            .data("/"),
+                    )
+                });
+
+                let notification_stream =
+                    BroadcastStream::new(notification_rx).filter_map(|result| async {
+                        match result {
+                            Ok(notification) => Some(Ok::<_, Infallible>(
+                                axum::response::sse::Event::default()
+                                    .event("notification")
+                                    .data(notification),
+                            )),
+                            Err(_) => None, // Skip broadcast errors
+                        }
+                    });
+
+                let keepalive_stream =
+                    IntervalStream::new(tokio::time::interval(std::time::Duration::from_secs(30)))
+                        .map(|_| {
+                            Ok::<_, Infallible>(
+                                axum::response::sse::Event::default()
+                                    .event("ping")
+                                    .data("keepalive"),
+                            )
+                        });
+
+                let combined_stream = endpoint_event
+                    .chain(notification_stream)
+                    .chain(keepalive_stream);
+
+                let mut response = axum::response::Sse::new(combined_stream)
+                    .keep_alive(
+                        axum::response::sse::KeepAlive::new()
+                            .interval(std::time::Duration::from_secs(15))
+                            .text("keepalive"),
+                    )
+                    .into_response();
+
+                let headers = response.headers_mut();
+                headers.insert(
+                    "mcp-protocol-version",
+                    HeaderValue::from_static("2025-06-18"),
+                );
+                headers.insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+                headers.insert("connection", HeaderValue::from_static("keep-alive"));
+
+                Ok::<_, StatusCode>(response)
             }
         };
 
-        // Log signal receipt as structured JSON
-        let signal_log = serde_json::json!({
-            "event": "signal_received",
-            "signal": signal_name,
-            "action": "shutting_down",
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        });
+        // Create method router that handles both GET (SSE) and POST (HTTP) at root
+        let root_methods = routing::method_routing::MethodRouter::new()
+            .get(sse_handler)
+            .fallback_service(http_service);
 
-        // Log to console and remote logger if configured
-        println!("{} - {}", LogStreamType::Command.as_display(), signal_log);
-        self.log(&signal_log.to_string(), LogStreamType::Command)
-            .await;
+        let app = Router::new()
+            .route("/", root_methods)
+            .with_state(sse_proxy)
+            .layer(
+                ServiceBuilder::new()
+                    .layer(middleware::from_fn(mcp_protocol_middleware))
+                    .layer(cors_layer),
+            );
 
-        ct.cancel();
+        // Start the server
+        info!(
+            "HTTP Streaming server running on {} (GET / for SSE, POST / for HTTP)",
+            http_settings.bind_addr
+        );
+
+        let listener = tokio::net::TcpListener::bind(http_settings.bind_addr).await?;
+        let server = axum::serve(listener, app);
+
+        tokio::select! {
+            result = server => {
+                if let Err(e) = result {
+                    tracing::error!("HTTP server error: {}", e);
+                }
+            }
+            _ = cancellation_token.cancelled() => {
+                info!("Received shutdown signal");
+            }
+        }
 
         Ok(())
     }
@@ -257,7 +425,6 @@ impl SseServerManager {
         });
         self.log(&cmd_log.to_string(), LogStreamType::Command).await;
 
-        // Create the command
         let mut command = Command::new(command_name);
         command.args(args);
 
@@ -558,12 +725,85 @@ impl AsyncWrite for LoggingChildProcess {
     }
 }
 
+/// A transport wrapper that captures notifications and forwards them to SSE
+pub struct NotificationCapturingTransport<T> {
+    inner: T,
+    notification_tx: Arc<broadcast::Sender<String>>,
+}
+
+impl<T> NotificationCapturingTransport<T> {
+    pub fn new(inner: T, notification_tx: Arc<broadcast::Sender<String>>) -> Self {
+        Self {
+            inner,
+            notification_tx,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for NotificationCapturingTransport<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let inner = Pin::new(&mut self.inner);
+        let result = inner.poll_read(cx, buf);
+
+        // check if the msg contains notifications
+        if let Poll::Ready(Ok(())) = result {
+            let data = buf.filled();
+            if !data.is_empty() {
+                let data_str = String::from_utf8_lossy(data);
+
+                for line in data_str.lines() {
+                    if let Ok(json_value) = serde_json::from_str::<Value>(line) {
+                        if let Some(method) = json_value.get("method").and_then(|m| m.as_str()) {
+                            if method.starts_with("notifications/") {
+                                let _ = self.notification_tx.send(line.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for NotificationCapturingTransport<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let inner = Pin::new(&mut self.inner);
+        inner.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = Pin::new(&mut self.inner);
+        inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let inner = Pin::new(&mut self.inner);
+        inner.poll_shutdown(cx)
+    }
+}
+
 /// Run the SSE server with a stdio client
 ///
 /// This function connects to a stdio server and exposes it as an SSE server.
 pub async fn run_sse_server(
     stdio_params: StdioServerParameters,
-    sse_settings: SseServerSettings,
+    http_settings: HttpServerSettings,
 ) -> Result<(), Box<dyn StdError>> {
     let server_manager = SseServerManager::new(
         stdio_params.log_url.clone(),
@@ -571,6 +811,6 @@ pub async fn run_sse_server(
     );
 
     server_manager
-        .run_sse_server(stdio_params, sse_settings)
+        .run_http_server(stdio_params, http_settings)
         .await
 }

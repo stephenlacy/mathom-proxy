@@ -6,8 +6,8 @@ use clap::{ArgAction, Parser};
 use rmcp_proxy::{
     config::get_config_dir,
     run_sse_client, run_sse_server,
-    sse_client::SseClientConfig,
-    sse_server::{SseServerSettings, StdioServerParameters},
+    sse_client::LocalSseClientConfig,
+    sse_server::{HttpServerSettings, StdioServerParameters},
 };
 use std::{collections::HashMap, env, error::Error, net::SocketAddr, process, time::Duration};
 use tracing::{debug, error};
@@ -18,21 +18,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[command(
     name = "mcp-proxy",
     version = env!("CARGO_PKG_VERSION"),
-    about = concat!("MCP Proxy v",env!("CARGO_PKG_VERSION"),". Start the MCP proxy in one of two possible modes: as an SSE or stdio client."),
+    about = concat!("MCP Proxy v",env!("CARGO_PKG_VERSION"),". Start the MCP proxy in one of two possible modes: as an HTTP/SSE client or HTTP server."),
     long_about = None,
     after_help = "Examples:\n  \
-        Connect to a remote SSE server:\n  \
-        mcp-proxy http://localhost:8080/sse\n\n  \
-        Expose a local stdio server as an SSE server:\n  \
-        mcp-proxy your-command --sse-port 8080 -e KEY VALUE -e ANOTHER_KEY ANOTHER_VALUE\n  \
-        mcp-proxy --sse-port 8080 -- your-command --arg1 value1 --arg2 value2\n  \
-        mcp-proxy --sse-port 8080 -- python mcp_server.py\n  \
-        mcp-proxy --sse-port 8080 --sse-host 0.0.0.0 -- npx -y @modelcontextprotocol/server-everything
+        Expose a local stdio server as an HTTP server:\n  \
+        mcp-proxy your-command --port 8080 -e KEY VALUE -e ANOTHER_KEY ANOTHER_VALUE\n  \
+        mcp-proxy --port 8080 -- your-command --arg1 value1 --arg2 value2\n  \
+        mcp-proxy --port 8080 -- python mcp_server.py\n  \
+        mcp-proxy --port 8080 --host 0.0.0.0 -- npx -y @modelcontextprotocol/server-everything
 ",
 )]
 struct Cli {
-    /// Command or URL to connect to. When a URL, will run an SSE client,
-    /// otherwise will run the given command and connect as a stdio client.
+    /// Command or URL to connect to. When a URL, will run an HTTP/SSE client,
+    /// otherwise will run the given command and expose it as an HTTP server.
     #[arg(env = "SSE_URL")]
     command_or_url: Option<String>,
 
@@ -52,13 +50,13 @@ struct Cli {
     #[arg(long = "pass-environment", action = ArgAction::SetTrue)]
     pass_environment: bool,
 
-    /// Port to expose an SSE server on. Default is a random port
-    #[arg(long = "sse-port", default_value = "0")]
-    sse_port: u16,
+    /// Port to expose an HTTP server on. Default is a random port
+    #[arg(long = "port", default_value = "0")]
+    port: u16,
 
-    /// Host to expose an SSE server on. Default is 127.0.0.1
-    #[arg(long = "sse-host", default_value = "127.0.0.1")]
-    sse_host: String,
+    /// Host to expose an HTTP server on. Default is 127.0.0.1
+    #[arg(long = "host", default_value = "127.0.0.1")]
+    host: String,
 
     /// URL to send logs to (optional)
     #[arg(long = "log-url", env = "LOG_URL")]
@@ -105,7 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Create SSE client config
-        let config = SseClientConfig {
+        let config = LocalSseClientConfig {
             url: command_or_url,
             headers,
         };
@@ -156,14 +154,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             access_token: cli.mathom_access_token,
         };
 
-        // Create SSE server settings
-        let sse_settings = SseServerSettings {
-            bind_addr: format!("{}:{}", cli.sse_host, cli.sse_port).parse::<SocketAddr>()?,
+        // Create HTTP server settings
+        let http_settings = HttpServerSettings {
+            bind_addr: format!("{}:{}", cli.host, cli.port).parse::<SocketAddr>()?,
             keep_alive: Some(Duration::from_secs(15)),
         };
 
-        // Run SSE server
-        run_sse_server(stdio_params, sse_settings).await?;
+        // Run HTTP server
+        run_sse_server(stdio_params, http_settings).await?;
     }
 
     Ok(())

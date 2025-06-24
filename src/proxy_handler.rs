@@ -9,16 +9,22 @@ use rmcp::{
     service::{RequestContext, RunningService},
     Error, RoleClient, RoleServer, ServerHandler,
 };
+use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::debug;
+
 
 /// A proxy handler that forwards requests to a client based on the server's capabilities
 #[derive(Clone)]
 pub struct ProxyHandler {
     client: Arc<Mutex<RunningService<RoleClient, ClientInfo>>>,
     // Store the server's capabilities to avoid locking the client on every get_info call
-    cached_info: Arc<ServerInfo>,
+    pub cached_info: Arc<ServerInfo>,
+    // Notification sender for server-to-client notifications (LoggingMessage, etc.)
+    // Currently unused but will be needed when we implement proper notification capture
+    #[allow(dead_code)]
+    notification_tx: Option<Arc<broadcast::Sender<String>>>,
 }
 
 impl ServerHandler for ProxyHandler {
@@ -279,34 +285,6 @@ impl ServerHandler for ProxyHandler {
             }
         }
     }
-
-    async fn on_progress(&self, notification: rmcp::model::ProgressNotificationParam) {
-        // Get a lock on the client
-        let client = self.client.clone();
-        let guard = client.lock().await;
-        match guard.notify_progress(notification).await {
-            Ok(_) => {
-                debug!("Proxying progress notification");
-            }
-            Err(err) => {
-                tracing::error!("Error notifying progress: {:?}", err);
-            }
-        }
-    }
-
-    async fn on_cancelled(&self, notification: rmcp::model::CancelledNotificationParam) {
-        // Get a lock on the client
-        let client = self.client.clone();
-        let guard = client.lock().await;
-        match guard.notify_cancelled(notification).await {
-            Ok(_) => {
-                debug!("Proxying cancelled notification");
-            }
-            Err(err) => {
-                tracing::error!("Error notifying cancelled: {:?}", err);
-            }
-        }
-    }
 }
 
 impl ProxyHandler {
@@ -314,19 +292,76 @@ impl ProxyHandler {
         let peer_info = client.peer_info();
 
         // Create a ServerInfo object that forwards the server's capabilities
+        // Add experimental SSE capability to advertise SSE transport support
+        let mut capabilities = peer_info.unwrap().capabilities.clone();
+        
+        // Add SSE capability to experimental capabilities
+        let mut experimental_caps = capabilities.experimental.unwrap_or_default();
+        let sse_capability = json!({
+            "enabled": true,
+            "endpoint": "/",
+            "protocol_version": "2025-06-18",
+            "description": "Streamable HTTP transport with SSE support per MCP 2025-06-18"
+        });
+        if let serde_json::Value::Object(sse_map) = sse_capability {
+            experimental_caps.insert("sse".to_string(), sse_map);
+        }
+        capabilities.experimental = Some(experimental_caps);
+        
         let cached_info = ServerInfo {
-            protocol_version: peer_info.protocol_version.clone(),
+            protocol_version: peer_info.unwrap().protocol_version.clone(),
             server_info: Implementation {
-                name: peer_info.server_info.name.clone(),
-                version: peer_info.server_info.version.clone(),
+                name: peer_info.unwrap().server_info.name.clone(),
+                version: peer_info.unwrap().server_info.version.clone(),
             },
-            instructions: peer_info.instructions.clone(),
-            capabilities: peer_info.capabilities.clone(),
+            instructions: peer_info.unwrap().instructions.clone(),
+            capabilities,
         };
 
         Self {
             client: Arc::new(Mutex::new(client)),
             cached_info: Arc::new(cached_info),
+            notification_tx: None,
+        }
+    }
+
+    pub fn new_with_notifications(
+        client: RunningService<RoleClient, ClientInfo>,
+        notification_tx: Arc<broadcast::Sender<String>>,
+    ) -> Self {
+        let peer_info = client.peer_info();
+
+        // Create a ServerInfo object that forwards the server's capabilities
+        // Add experimental SSE capability to advertise SSE transport support
+        let mut capabilities = peer_info.unwrap().capabilities.clone();
+        
+        // Add SSE capability to experimental capabilities
+        let mut experimental_caps = capabilities.experimental.unwrap_or_default();
+        let sse_capability = json!({
+            "enabled": true,
+            "endpoint": "/",
+            "protocol_version": "2025-06-18",
+            "description": "Streamable HTTP transport with SSE support per MCP 2025-06-18"
+        });
+        if let serde_json::Value::Object(sse_map) = sse_capability {
+            experimental_caps.insert("sse".to_string(), sse_map);
+        }
+        capabilities.experimental = Some(experimental_caps);
+        
+        let cached_info = ServerInfo {
+            protocol_version: peer_info.unwrap().protocol_version.clone(),
+            server_info: Implementation {
+                name: peer_info.unwrap().server_info.name.clone(),
+                version: peer_info.unwrap().server_info.version.clone(),
+            },
+            instructions: peer_info.unwrap().instructions.clone(),
+            capabilities,
+        };
+
+        Self {
+            client: Arc::new(Mutex::new(client)),
+            cached_info: Arc::new(cached_info),
+            notification_tx: Some(notification_tx),
         }
     }
 }
